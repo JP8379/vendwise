@@ -10,9 +10,16 @@ class Transaction extends Model
         'user_id',
         'type',
         'category',
+        'product_id',
+        'quantity',
         'amount',
         'description',
         'payment_method',
         'date',
     ];
+
+    public function product()
+    {
+        return $this->belongsTo(Product::class);
+    }
 }

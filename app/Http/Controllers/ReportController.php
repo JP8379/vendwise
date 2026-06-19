@@ -2,118 +2,279 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Transaction;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
+use PDF;
+use Carbon\Carbon;
+use App\Models\Transaction;
 
 class ReportController extends Controller
 {
-    public function index($period = 'daily')
+    /**
+     * Shared helper: build date range + query filter based on period
+     */
+    private function buildPeriodQuery($period, $query)
     {
-        $userId = auth()->id();
+        $reportStart = $reportEnd = now();
 
-        if (!in_array($period, ['daily', 'monthly', 'yearly'])) {
-            $period = 'daily';
+        switch ($period) {
+            case 'daily':
+                $reportStart = Carbon::today();
+                $reportEnd   = Carbon::today();
+                $query->whereDate('date', $reportStart);
+                break;
+
+            case 'weekly':
+                $reportStart = Carbon::now()->startOfWeek();
+                $reportEnd   = Carbon::now()->endOfWeek();
+                $query->whereBetween('date', [$reportStart, $reportEnd]);
+                break;
+
+            case 'yearly':
+                $reportStart = Carbon::now()->startOfYear();
+                $reportEnd   = Carbon::now()->endOfYear();
+                $query->whereYear('date', $reportStart->year);
+                break;
+
+            case 'monthly':
+            default:
+                $period      = 'monthly';
+                $reportStart = Carbon::now()->startOfMonth();
+                $reportEnd   = Carbon::now()->endOfMonth();
+                $query->whereMonth('date', $reportStart->month)
+                      ->whereYear('date', $reportStart->year);
+                break;
         }
 
-        $totalSales = Transaction::where('user_id', $userId)
-            ->where('type', 'sale')
-            ->sum('amount');
+        return [$period, $reportStart, $reportEnd, $query];
+    }
 
-        $totalIncome = Transaction::where('user_id', $userId)
-            ->where('type', 'income')
-            ->sum('amount');
+    /**
+     * Shared helper: build grouped trend data from transactions
+     * For yearly: group by month label (Jan, Feb, ...)
+     * For weekly: group by day name (Mon, Tue, ...)
+     * For daily/monthly: group by dd/mm/yyyy
+     */
+    private function buildTrendData($transactions, $period)
+    {
+        if ($period === 'yearly') {
+            $grouped = $transactions->groupBy(
+                fn($t) => Carbon::parse($t->date)->format('M Y')
+            );
+        } elseif ($period === 'weekly') {
+            $grouped = $transactions->groupBy(
+                fn($t) => Carbon::parse($t->date)->format('D d/m')
+            );
+        } else {
+            $grouped = $transactions->groupBy(
+                fn($t) => Carbon::parse($t->date)->format('d/m/Y')
+            );
+        }
 
-        $totalExpenses = Transaction::where('user_id', $userId)
-            ->where('type', 'expense')
-            ->sum('amount');
+        $trendLabels  = $grouped->keys()->toArray();
+        $salesData    = $grouped->map(fn($g) => $g->where('type', 'sale')->sum('amount'))->values()->toArray();
+        $incomeData   = $grouped->map(fn($g) => $g->where('type', 'income')->sum('amount'))->values()->toArray();
+        $expensesData = $grouped->map(fn($g) => $g->where('type', 'expense')->sum('amount'))->values()->toArray();
+        $profitData   = $grouped->map(fn($g) =>
+            $g->where('type', 'sale')->sum('amount') +
+            $g->where('type', 'income')->sum('amount') -
+            $g->where('type', 'expense')->sum('amount')
+        )->values()->toArray();
 
-        $netProfit = ($totalSales + $totalIncome) - $totalExpenses;
+        return [$trendLabels, $salesData, $incomeData, $expensesData, $profitData];
+    }
+
+    /**
+     * Shared helper: build smart suggestions based on financial data
+     */
+    private function buildSmartSuggestions($netProfit, $totalSales, $totalIncome, $totalExpenses, $period)
+    {
+        $smartSuggestions = [];
+        $totalRevenue     = $totalSales + $totalIncome;
+        $profitMargin     = $totalRevenue > 0 ? ($netProfit / $totalRevenue) * 100 : 0;
+        $periodLabel      = ucfirst($period);
+
+        // Profit status
+        if ($netProfit > 0) {
+            $smartSuggestions[] = [
+                'title'   => 'Healthy Profit',
+                'message' => "Your net profit is positive for this {$periodLabel} period. Keep up the current sales strategy.",
+                'type'    => 'success',
+            ];
+        } elseif ($netProfit < 0) {
+            $smartSuggestions[] = [
+                'title'   => 'Profit Warning',
+                'message' => "Net profit is negative for this {$periodLabel} period. Consider reviewing expenses or increasing sales.",
+                'type'    => 'danger',
+            ];
+        } else {
+            $smartSuggestions[] = [
+                'title'   => 'Break-even',
+                'message' => "Net profit is zero for this {$periodLabel} period. Check if income and expenses are balanced.",
+                'type'    => 'warning',
+            ];
+        }
+
+        // Low profit margin
+        if ($profitMargin < 5 && $totalRevenue > 0) {
+            $smartSuggestions[] = [
+                'title'   => 'Low Profit Margin',
+                'message' => "Your profit margin is below 5% ({$periodLabel}). Try reducing costs or increasing your prices.",
+                'type'    => 'danger',
+            ];
+        } elseif ($profitMargin >= 15 && $totalRevenue > 0) {
+            $smartSuggestions[] = [
+                'title'   => 'Strong Profit Margin',
+                'message' => "Excellent! Your profit margin is above 15% ({$periodLabel}). Consider reinvesting in growth.",
+                'type'    => 'success',
+            ];
+        }
+
+        // Expenses vs sales
+        if ($totalExpenses > $totalSales && $totalSales > 0) {
+            $smartSuggestions[] = [
+                'title'   => 'Expenses Exceed Sales',
+                'message' => "Your expenses are higher than your sales revenue this {$periodLabel}. Review your spending carefully.",
+                'type'    => 'danger',
+            ];
+        }
+
+        // No transactions
+        if ($totalRevenue === 0 && $totalExpenses === 0) {
+            $smartSuggestions = [[
+                'title'   => 'No Data',
+                'message' => "No transactions found for this {$periodLabel} period. Add transactions to generate insights.",
+                'type'    => 'warning',
+            ]];
+        }
+
+        return $smartSuggestions;
+    }
+
+    /**
+     * Show report page
+     */
+    public function index(Request $request, $period = 'monthly')
+    {
+        $user = auth()->user();
+
+        $transactionsQuery = Transaction::where('user_id', $user->id);
+
+        [$period, $reportStart, $reportEnd, $transactionsQuery] =
+            $this->buildPeriodQuery($period, $transactionsQuery);
+
+        $transactions = $transactionsQuery->orderBy('date', 'asc')->get();
+
+        // Totals
+        $totalSales    = $transactions->where('type', 'sale')->sum('amount');
+        $totalIncome   = $transactions->where('type', 'income')->sum('amount');
+        $totalExpenses = $transactions->where('type', 'expense')->sum('amount');
+        $netProfit     = $totalSales + $totalIncome - $totalExpenses;
 
         $summary = [
-            'total_sales' => $totalSales,
-            'total_income' => $totalIncome,
+            'total_sales'    => $totalSales,
+            'total_income'   => $totalIncome,
             'total_expenses' => $totalExpenses,
-            'net_profit' => $netProfit,
+            'net_profit'     => $netProfit,
         ];
-
-        if ($period === 'daily') {
-            $rows = Transaction::select(
-                    DB::raw("DATE(date) as label"),
-                    DB::raw("SUM(CASE WHEN type = 'sale' THEN amount ELSE 0 END) as sales"),
-                    DB::raw("SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END) as income"),
-                    DB::raw("SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END) as expenses")
-                )
-                ->where('user_id', $userId)
-                ->groupBy(DB::raw("DATE(date)"))
-                ->orderBy(DB::raw("DATE(date)"))
-                ->get();
-
-            $trendLabels = $rows->pluck('label')->map(fn($d) => date('d M', strtotime($d)))->values();
-        } elseif ($period === 'monthly') {
-            $rows = Transaction::select(
-                    DB::raw("YEAR(date) as year"),
-                    DB::raw("MONTH(date) as month"),
-                    DB::raw("SUM(CASE WHEN type = 'sale' THEN amount ELSE 0 END) as sales"),
-                    DB::raw("SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END) as income"),
-                    DB::raw("SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END) as expenses")
-                )
-                ->where('user_id', $userId)
-                ->groupBy(DB::raw("YEAR(date)"), DB::raw("MONTH(date)"))
-                ->orderBy(DB::raw("YEAR(date)"))
-                ->orderBy(DB::raw("MONTH(date)"))
-                ->get();
-
-            $monthNames = [
-                1 => 'Jan', 2 => 'Feb', 3 => 'Mar', 4 => 'Apr',
-                5 => 'May', 6 => 'Jun', 7 => 'Jul', 8 => 'Aug',
-                9 => 'Sep', 10 => 'Oct', 11 => 'Nov', 12 => 'Dec'
-            ];
-
-            $trendLabels = $rows->map(fn($row) => $monthNames[$row->month] . ' ' . $row->year)->values();
-        } else {
-            $rows = Transaction::select(
-                    DB::raw("YEAR(date) as label"),
-                    DB::raw("SUM(CASE WHEN type = 'sale' THEN amount ELSE 0 END) as sales"),
-                    DB::raw("SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END) as income"),
-                    DB::raw("SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END) as expenses")
-                )
-                ->where('user_id', $userId)
-                ->groupBy(DB::raw("YEAR(date)"))
-                ->orderBy(DB::raw("YEAR(date)"))
-                ->get();
-
-            $trendLabels = $rows->pluck('label')->values();
-        }
-
-        $salesData = [];
-        $profitData = [];
-        $expensesData = [];
-
-        foreach ($rows as $row) {
-            $sales = (float) $row->sales;
-            $income = (float) $row->income;
-            $expenses = (float) $row->expenses;
-
-            $salesData[] = $sales;
-            $expensesData[] = $expenses;
-            $profitData[] = ($sales + $income) - $expenses;
-        }
 
         $distribution = [
-            'sales' => $totalSales,
+            'sales'        => $totalSales,
             'other_income' => $totalIncome,
-            'expenses' => $totalExpenses,
+            'expenses'     => $totalExpenses,
         ];
+
+        [$trendLabels, $salesData, $incomeData, $expensesData, $profitData] =
+            $this->buildTrendData($transactions, $period);
+
+        $smartSuggestions = $this->buildSmartSuggestions(
+            $netProfit, $totalSales, $totalIncome, $totalExpenses, $period
+        );
+
+        $reportPeriodLabel = ucfirst($period);
+        $reportRange       = $reportStart->format('d/m/Y') . ' - ' . $reportEnd->format('d/m/Y');
 
         return view('reports.index', compact(
             'summary',
+            'distribution',
             'trendLabels',
             'salesData',
-            'profitData',
+            'incomeData',
             'expensesData',
-            'distribution',
-            'period'
+            'profitData',
+            'smartSuggestions',
+            'period',
+            'reportPeriodLabel',
+            'reportRange'
         ));
+    }
+
+    /**
+     * Generate PDF report
+     */
+    public function generatePDF(Request $request, $period = 'monthly')
+    {
+        $user = auth()->user();
+
+        $transactionsQuery = Transaction::where('user_id', $user->id);
+
+        [$period, $reportStart, $reportEnd, $transactionsQuery] =
+            $this->buildPeriodQuery($period, $transactionsQuery);
+
+        $transactions = $transactionsQuery->orderBy('date', 'asc')->get();
+
+        $totalSales    = $transactions->where('type', 'sale')->sum('amount');
+        $totalIncome   = $transactions->where('type', 'income')->sum('amount');
+        $totalExpenses = $transactions->where('type', 'expense')->sum('amount');
+        $netProfit     = $totalSales + $totalIncome - $totalExpenses;
+
+        [$trendLabels, $salesData, $incomeData, $expensesData, $profitData] =
+            $this->buildTrendData($transactions, $period);
+
+        $smartSuggestions = $this->buildSmartSuggestions(
+            $netProfit, $totalSales, $totalIncome, $totalExpenses, $period
+        );
+
+        $totalRevenue = $totalSales + $totalIncome;
+        $profitMargin = $totalRevenue > 0 ? ($netProfit / $totalRevenue) * 100 : 0;
+        $expenseRatio = $totalRevenue > 0 ? ($totalExpenses / $totalRevenue) * 100 : 0;
+
+        $data = [
+            'transactions'      => $transactions,
+            'summary' => [
+                'total_sales'    => $totalSales,
+                'total_income'   => $totalIncome,
+                'total_expenses' => $totalExpenses,
+                'net_profit'     => $netProfit,
+            ],
+            'distribution' => [
+                'sales'        => $totalSales,
+                'other_income' => $totalIncome,
+                'expenses'     => $totalExpenses,
+            ],
+            'trendLabels'       => $trendLabels,
+            'salesData'         => $salesData,
+            'incomeData'        => $incomeData,
+            'expensesData'      => $expensesData,
+            'profitData'        => $profitData,
+            'smartSuggestions'  => $smartSuggestions,
+            'profitMargin'      => $profitMargin,
+            'expenseRatio'      => $expenseRatio,
+            'businessName'      => $user->business_name ?? $user->name,
+            'period'            => ucfirst($period),
+            'reportRange'       => $reportStart->format('d/m/Y') . ' - ' . $reportEnd->format('d/m/Y'),
+            'generatedAt'       => now('Asia/Kuala_Lumpur')->format('d/m/Y h:i A'),
+            'logoPath'          => public_path('images/v-logo.png'),
+            // Chart images from browser canvas
+            'salesExpenseChart' => $request->input('sales_expense_chart'),
+            'distributionChart' => $request->input('distribution_chart'),
+            'profitChart'       => $request->input('profit_chart'),
+        ];
+
+        $pdf = PDF::loadView('reports.pdf', $data)
+                  ->setPaper('A4', 'portrait');
+
+        $fileName = 'vendwise-' . $period . '-report-' . now('Asia/Kuala_Lumpur')->format('Ymd-His') . '.pdf';
+
+        return $pdf->download($fileName);
     }
 }
